@@ -64,7 +64,7 @@ tesis-oficial/
 | RF-15 | Endpoint verificación integridad | ✅ O(n) real, detecta alteración | ✅ Botón con resultado | **Implementado** |
 | RF-16 | `audit_logs` inmutable | ✅ 8+ tipos de acción auditados | ✅ AuditoriaPage | **Implementado** |
 | RF-17 | JWT + RBAC 3 roles | ✅ Claims completos, revocación, RBAC server-side | ✅ Rutas protegidas, JWT en memoria | **Implementado** |
-| RF-18 | Estado conectividad por dispositivo | ✅ Disponible y filtrable | ⚠️ Mostrado en DispositivosPage, **NO en Dashboard** | **Parcial** |
+| RF-18 | Estado conectividad por dispositivo | ✅ Disponible y filtrable | ✅ DispositivosPage **y Dashboard** (Badge junto al device_id) | **Implementado** |
 
 **RF-18 requiere** según TI: "El dashboard muestra el estado de conectividad de cada dispositivo registrado". Actualmente la conectividad se ve en DispositivosPage pero NO en el Dashboard principal (que solo muestra estado de conexión SSE). Brecha menor.
 
@@ -183,9 +183,20 @@ La auditoría de Fases 1-3 (documentos en `documentacion/Documentacion-general/`
 
 ## 4. LO QUE FALTA — BRECHAS RESIDUALES
 
-### 4.1 [BAJO] RF-18 en Dashboard principal
+> **Estado 2026-07-25**: las brechas 4.1, 4.2 y 4.3 están **cerradas**. Ver
+> `verificacion_cierre_2026-07-25.md` para el detalle, y la nueva brecha
+> encontrada durante ese cierre (contrato IoT↔backend, ya corregida; y el
+> `connect-src` del CSP de Vercel, que es una puerta de despliegue).
+
+### 4.1 [CERRADO] RF-18 en Dashboard principal
 
 **Problema**: TI dice "El dashboard muestra el estado de conectividad de cada dispositivo registrado". La conectividad se muestra en `DispositivosPage` pero NO en `DashboardPage`.
+
+**Resuelto**: `DashboardPage.tsx` renderiza una `Badge` de conectividad junto al
+`device_id` de la curva térmica, con claves i18n propias
+(`dashboard.dispositivoOnline` / `dispositivoOffline`) distintas de las del
+indicador SSE, porque son estados distintos. Cubierto por
+`src/tests/presentation/pages/DashboardPage.test.tsx` (3 pruebas).
 
 **Fix sugerido**: Agregar un badge de conectividad del dispositivo en el Dashboard (junto al `device_id` mostrado en la gráfica térmica). El campo `estado_conectividad` ya viaja en el payload de SSE — solo falta renderizarlo.
 
@@ -199,26 +210,64 @@ La auditoría de Fases 1-3 (documentos en `documentacion/Documentacion-general/`
 </Badge>
 ```
 
-### 4.2 [BAJO] Escaneo de dependencias vulnerables
+### 4.2 [CERRADO] Escaneo de dependencias vulnerables
 
-**No ejecutado** en el análisis actual:
+**Ejecutado el 2026-07-25**:
 
-```bash
-cd backend && pip-audit
-cd frontend/frontend && npm audit
-cd landing/landing-page && npm audit
+| Componente | Herramienta | Resultado |
+|-----------|-------------|-----------|
+| backend | `pip-audit` | **0 vulnerabilidades** |
+| landing-page | `npm audit` | **0 vulnerabilidades** |
+| frontend | `npm audit` | 5 altas, **todas de desarrollo** |
+| frontend | `npm audit --omit=dev` | **0 vulnerabilidades** en el árbol de producción |
+
+Las 5 altas del frontend son una sola cadena: `eslint → @eslint/config-array →
+minimatch@3 → brace-expansion@1.1.16` (GHSA-mh99-v99m-4gvg, DoS por expansión
+no acotada). No entran al bundle: `eslint` es `devDependency` y el árbol de
+producción sale limpio. No existe parche en la línea 1.x (1.1.16 es la última),
+así que el único remedio es subir a `eslint@10`, un mayor con ruptura. Se
+documenta y **no se aplica antes de la sustentación**: es un DoS en un linter
+que solo procesa código propio.
+
+### 4.3 [CERRADO] Verificación de CSP contra frontend real
+
+Verificado el 2026-07-25. La premisa original estaba equivocada: el CSP del
+**backend** (`default-src 'none'`) solo gobierna las respuestas JSON de la API,
+no el documento del frontend, así que no puede romper SSE, Tailwind ni ECharts.
+El CSP que sí gobierna el dashboard es el de `frontend/vercel.json`.
+
+Contrastado directiva por directiva contra el build de producción real:
+
+| Directiva | Necesidad real del frontend | Veredicto |
+|-----------|----------------------------|-----------|
+| `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com` | Tailwind inyecta estilos inline; `index.css` importa CSS de Google Fonts | ✅ correcto |
+| `font-src https://fonts.gstatic.com` | No hay fuentes auto-hospedadas; todas vienen de gstatic | ✅ correcto |
+| `script-src 'self'` | ECharts va empaquetado, sin CDN | ✅ correcto |
+| `img-src 'self' data:` | ECharts y los iconos no cargan imágenes remotas | ✅ correcto |
+| `connect-src 'self'` | axios + `EventSource` hacia el backend | ⚠️ **ver 4.7** |
+
+### 4.7 [PUERTA DE DESPLIEGUE] `connect-src` bloquea el backend real
+
+`frontend/vercel.json` declara `connect-src 'self'`. **Hoy no rompe nada**
+porque Vercel construye con `build:demo`, y en modo demo `apiClient` usa
+`demoAdapter` y `sseClient` usa `simularStream`: no sale ni una petición de red.
+
+Pero en cuanto se despliegue el frontend real apuntando al backend de Railway
+(la arquitectura de la tesis: Vercel → Railway), `connect-src 'self'` **bloquea
+todas las llamadas de la API y el `EventSource` del SSE**, porque el backend es
+otro origen.
+
+**Fix cuando exista el despliegue real** — añadir el origen del backend:
+
+```jsonc
+// frontend/vercel.json
+"connect-src 'self' https://<backend>.up.railway.app"
 ```
 
-Recomendación: ejecutar antes de la sustentación y documentar resultados.
-
-### 4.3 [BAJO] Verificación de CSP contra frontend real
-
-Backend emite `Content-Security-Policy` restrictivo. Verificar que no rompe:
-- SSE (necesita `connect-src` correcto)
-- Tailwind inline styles
-- ECharts SVG rendering
-
-Probar con `npm run build && npm run preview` y revisar consola del navegador.
+El lado del backend ya está resuelto: `cors_origins` es configurable por entorno
+y los validadores de producción rechazan `*` y orígenes sin `https://`
+(`src/infrastructure/config.py`). Solo falta el lado del CSP, que está fijo en
+`vercel.json` y por eso no se pudo cerrar sin conocer el hostname definitivo.
 
 ### 4.4 [PENDIENTE PRÁCTICO] Integración física IoT ↔ Backend
 
@@ -442,12 +491,13 @@ El sistema presenta **todos los componentes funcionales exigidos por TI y el Pro
 - Cobertura end-to-end de HU-37 (Checklist BPA), HU-38 (PDF), HU-23 (notificaciones), HU-30 (calibración), HU-43 a HU-47 (dispositivos, privacidad, desactivación, firmware, corrupción)
 - Code-splitting, ESLint, tests, ErrorBoundary — calidad de ingeniería de software
 
-**Brechas residuales (no bloqueantes para sustentación)**:
-1. RF-18: Conectividad de dispositivo visible en DispositivosPage pero no en Dashboard principal (fix trivial)
-2. Escaneo de dependencias (`pip-audit` / `npm audit`) pendiente
-3. Verificación de CSP contra build de producción pendiente
-4. Integración física IoT ↔ Backend (10 pasos, ver sección 4.4)
-5. Métricas de infraestructura (RNF-01, RNF-02, RNF-10) requieren medición en despliegue real
+**Brechas residuales (actualizado 2026-07-25)**:
+1. ~~RF-18 en Dashboard~~ → **cerrado** (Badge + 3 pruebas)
+2. ~~Escaneo de dependencias~~ → **cerrado** (backend y landing limpios; frontend limpio en producción)
+3. ~~Verificación de CSP~~ → **cerrado**, y destapó la puerta de despliegue 4.7
+4. `connect-src` de `vercel.json` debe incluir el origen del backend antes del primer despliegue no-demo (sección 4.7)
+5. Integración física IoT ↔ Backend (10 pasos, ver sección 4.4)
+6. Métricas de infraestructura (RNF-01, RNF-02, RNF-10) requieren medición en despliegue real
 
 ### Veredicto corregido
 

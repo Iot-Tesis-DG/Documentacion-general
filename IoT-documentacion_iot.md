@@ -1,5 +1,16 @@
 # Documentación IoT — Nodo Edge ESP32
 
+> ⚠️ **Revisión 2026-07-25.** El firmware de este repositorio **nunca se había
+> compilado**. `pio run` fallaba con 4 errores, así que ninguna de las
+> afirmaciones de "implementado" de este documento ni del análisis final estaba
+> respaldada por un binario. Se corrigió y **hoy compila** (Flash 78.3 %, RAM
+> 14.3 %). Ver `verificacion_cierre_2026-07-25.md` §10 para el detalle de los
+> cinco defectos encontrados: compilación, partición LittleFS inexistente,
+> telemetría en vivo nunca publicada, QoS 1 inexistente y `setMinSupportedTLS`
+> como API inventada.
+>
+> Sigue **sin validarse con hardware real**: compilar no es ejecutar.
+
 > **Proyecto**: ThermoTrace — Monitoreo IoT + IA de Cadena de Frío Farmacéutica
 > **Tesis UPC 2026**: Soto Quispe, Diego Ulises & Gamio Upiachihua, Brenda Lucía
 > **Stack Edge**: ESP32 DevKitC V4 + Arduino Core (ESP-IDF) + FreeRTOS
@@ -200,7 +211,7 @@ iot-firmware/
         ├── PayloadBuilder.h      # Constructor JSON con ArduinoJson v7 — interfaz
         └── PayloadBuilder.cpp    # Constructor JSON — implementación (NTP, ISO 8601)
 
-19 archivos · 1510 líneas de código C++
+18 archivos · 1394 líneas de código C++ (`src/`, verificado 2026-07-25)
 ```
 
 ### 3.2 Arquitectura Dual-Core (FreeRTOS)
@@ -430,17 +441,29 @@ Core 1 (Application Core) — xTaskCreatePinnedToCore(..., 1)
 
 ```python
 class LecturaPayload(BaseModel):
-    device_id: str = Field(..., min_length=1, max_length=50)
+    # Contrato cerrado: un campo no declarado es un error, no algo que se
+    # silencie. NaN/infinito nunca llegan a persistencia, IA ni trazabilidad.
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    device_id: str = Field(min_length=1, max_length=50)
     timestamp: datetime
-    estado_conectividad: Literal["online", "offline"] = "offline"
-    firmware_version: str = Field(..., min_length=1, max_length=20)
-    temperatura_interna: float | None = None
-    temperatura_ambiental: float | None = None
-    humedad_ambiental: float | None = None
+    message_id: str | None = Field(default=None, max_length=100)
+    temperatura_ambiental: float | None = Field(default=None, ge=-40.0, le=125.0)
+    humedad_ambiental: float | None = Field(default=None, ge=0.0, le=100.0)
+    temperatura_interna: float | None = Field(default=None, ge=-55.0, le=125.0)
     apertura_refrigerador: bool = False
+    estado_conectividad: str = "online"
+    firmware_version: str | None = None
     duracion_apertura_segundos: int = Field(default=0, ge=0)
-    modelo_config = ConfigDict(extra="forbid")
 ```
+
+> **Nota de integración (2026-07-25).** `duracion_apertura_segundos` faltaba en
+> `LecturaPayload`. Como el contrato es `extra="forbid"` y `PayloadBuilder::build()`
+> emite ese campo en **todas** las lecturas (0 con la puerta cerrada), el backend
+> rechazaba el 100% de los mensajes del firmware real con `ValidationError`.
+> Ninguna prueba lo detectaba porque todas construían el payload a mano. Corregido
+> y cubierto por `tests/integration/test_contrato_firmware_esp32.py`, que valida
+> contra el payload literal de esta sección.
 
 ### 3.6 Estrategia de Tolerancia a Fallos
 
@@ -453,7 +476,7 @@ class LecturaPayload(BaseModel):
 | **Sensor DS18B20 desconectado** | `readTemperatureC()` retorna `NAN`. JSON envía `"temperatura_interna": null`. | Backend: guard de sensores → sin inferencia. No se genera alerta falsa. |
 | **Sensor SHT31 no responde** | Reintenta 1 vez. Si falla, retorna `NAN`. JSON: ambos campos como `null`. | Backend trata ambos como ausentes. La clasificación sigue con sensor interno. |
 | **Timestamp no sincronizado (NTP falló)** | Usa `__DATE__` + `__TIME__` de compilación + `millis()` como fallback. | Backend valida ventana ±2h. Si timestamp muy desviado, rechaza lectura. |
-| **PUBACK no recibido (QoS 1)** | El mensaje NO se elimina de LittleFS. | Al reconectar se reenvía. Backend: UNIQUE(device_id, timestamp) → idempotente. |
+| **Paquete perdido en vuelo** | ⚠️ La publicación es QoS 0: no hay PUBACK. Se revalida la sesión antes de borrar el archivo, lo que acota la ventana pero no la cierra. | Backend: UNIQUE(device_id, timestamp) → todo reenvío es idempotente. Cerrar del todo exige un cliente con QoS 1 (§8.2). |
 | **Reconexión Wi-Fi durante publicación** | PubSubClient reintenta internamente. Si falla, `publish()` retorna 0. | Archivo permanece en LittleFS. Se reintenta en el próximo ciclo de taskRed(). |
 | **ESP32 se apaga abruptamente** | EMQX detecta timeout de keep-alive (60s). Publica LWT `offline` automáticamente. | Backend recibe `lwt_offline` → actualiza `estado_conectividad = false`. Dashboard muestra badge rojo. |
 | **Múltiples ESP32 publicando simultáneamente** | Cada uno en su propio topic `farmacias/{device_id}/lecturas`. | Backend suscrito a `farmacias/+/lecturas` (comodín). Sin contención entre dispositivos. |
@@ -462,16 +485,16 @@ class LecturaPayload(BaseModel):
 
 | Control | Código | Alineamiento |
 |---------|--------|-------------|
-| **TLS 1.2 mínimo** | `_client.setMinSupportedTLS(TLSv1_2)` en `MQTTManager.cpp:111` | OWASP IoT STG v1.0.0 — ISVS-CRYPT-01 |
-| **Validación CA raíz** | `_client.setCACert(ca.c_str())` cargado desde LittleFS en `MQTTManager.cpp:38` | OWASP IoT STG — ISVS-CRYPT-02 |
+| **TLS 1.2** | Lo impone mbedTLS de ESP-IDF (TLS 1.2 es el único protocolo habilitado). `setMinSupportedTLS` **no existe** en `WiFiClientSecure` de ESP32 — era API de ESP8266 e impedía compilar; se eliminó. | OWASP IoT STG v1.0.0 — ISVS-CRYPT-01 |
+| **Validación CA raíz** | `_client.setCACert(ca.c_str())` cargado desde LittleFS — `MQTTManager.cpp:26` | OWASP IoT STG — ISVS-CRYPT-02 |
 | **SNI automático** | `WiFiClientSecure` envía el hostname del broker durante handshake TLS (nativo del SDK) | OWASP IoT STG — ISVS-NET-01 |
-| **Autenticación por dispositivo** | `device_id` como username + token como password en `mqtt.connect()` (`MQTTManager.cpp:73`) | OWASP IoT STG — ISVS-AUTH-01 |
+| **Autenticación por dispositivo** | `device_id` como username + token como password en `_mqtt.connect()` — `MQTTManager.cpp:90-98` | OWASP IoT STG — ISVS-AUTH-01 |
 | **Credenciales fuera del código** | `WIFI_PASSWORD` y `MQTT_TOKEN` definibles vía `build_flags` en `platformio.ini`, no en texto plano en `config.h` | RNF-05 |
-| **LWT (Last Will)** | Configurado ANTES de `connect()` en `MQTTManager.cpp:68-78`. Payload offline/online en `config.h:41-42` | OWASP IoT STG — ISVS-COM-02 |
+| **LWT (Last Will)** | Registrado en el propio CONNECT (QoS 1) — `MQTTManager.cpp:90-98`. Payloads en `config.h:41-42` | OWASP IoT STG — ISVS-COM-02 |
 | **Puerto seguro** | `MQTT_PORT 8883` en `config.h:28`. Puerto 1883 bloqueado en EMQX Cloud (HU-14) | OWASP IoT STG — ISVS-NET-02 |
 | **Anti-spoofing** | Backend verifica `device_id` en payload == segmento del topic (`main.py::_device_id_del_topic`) | OWASP IoT STG — ISVS-AUTH-03 |
 | **Deduplicación** | `UNIQUE(device_id, timestamp)` en PostgreSQL (`models.py:109`). Previene replay attacks vía QoS 1 reenvíos. | OWASP IoT STG — ISVS-DATA-01 |
-| **Particiones flash** | Separación app (1.2 MB) / LittleFS (1.5 MB) / NVS (64 KB). Sin ejecución de código desde LittleFS. | OWASP IoT STG — ISVS-STOR-01 |
+| **Particiones flash** | `partitions_thermotrace.csv`: app0/app1 1216 KB + littlefs 1600 KB. Antes se usaba `default_ffat.csv`, **sin partición `littlefs`**, y el nodo no arrancaba. | OWASP IoT STG — ISVS-STOR-01 |
 
 ### 3.8 Trazabilidad de HUs del Backlog
 
@@ -483,12 +506,12 @@ class LecturaPayload(BaseModel):
 | HU-04 | MC-38 con debounce | `MC38Sensor.cpp` | `isOpen()` → debounce 50 ms, `openDurationSec()` |
 | HU-05 | Payload JSON canónico | `PayloadBuilder.cpp` | `build()` → ArduinoJson v7, null explícito |
 | HU-06 | Buffer LittleFS offline | `LittleFSBuffer.cpp` | `saveReading()` → FIFO, `pendingCount()` |
-| HU-07 | Sync buffer con QoS 1 | `main.cpp:144-161` | `taskRed()` → publica en orden FIFO, elimina tras publish |
+| HU-07 | Sync buffer | `main.cpp::drenarBuffer()` | FIFO acotado a 20/ciclo; elimina tras publicar y revalidar sesión. **QoS 0**, no QoS 1 |
 | HU-08 | Backoff exponencial Wi-Fi | `WiFiManager.cpp` | `_increaseBackoff()` → 1s→2s→4s...→60s |
-| HU-09 | TLS 1.2 con validación CA | `MQTTManager.cpp:111` | `setMinSupportedTLS()` + `setCACert()` desde LittleFS |
-| HU-10 | device_id + SNI + token | `MQTTManager.cpp:73` | `mqtt.connect()` con username=device_id |
-| HU-11 | QoS 1 publish | `MQTTManager.cpp:130` | `mqtt.publish()` con QoS 1, espera PUBACK |
-| HU-13 | LWT online/offline | `MQTTManager.cpp:68-78` | LWT topic + payload configurados antes de connect |
+| HU-09 | TLS 1.2 con validación CA | `MQTTManager.cpp:26` | `setCACert()` desde LittleFS (TLS 1.2 lo fija mbedTLS) |
+| HU-10 | device_id + SNI + token | `MQTTManager.cpp:90-98` | `_mqtt.connect()` con username=device_id |
+| HU-11 | ~~QoS 1 publish~~ | `MQTTManager.cpp:130-164` | ⚠️ **NO CUMPLIDA**. `PubSubClient::publish()` es QoS 0: no hay PUBACK ni packetId. Requiere cambiar de cliente MQTT (§8.2) |
+| HU-13 | LWT online/offline | `MQTTManager.cpp:90-98`, `:116` | LWT en el CONNECT (QoS 1) + publicación de `online` al conectar |
 
 ---
 
